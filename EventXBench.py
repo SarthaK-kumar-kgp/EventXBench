@@ -24,7 +24,7 @@ import datasets
 
 _DESCRIPTION = (
     "EventX: A multimodal benchmark linking Twitter/X posts to "
-    "Polymarket prediction market dynamics across six tasks."
+    "Polymarket prediction market dynamics across seven tasks."
 )
 
 _HOMEPAGE = "https://github.com/mlsys-io/EventXBench"

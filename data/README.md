@@ -31,7 +31,7 @@ A multimodal benchmark linking 9M Twitter/X posts to 11,952 Polymarket predictio
 
 ## Dataset Description
 
-EventX connects social media posts on Twitter/X to prediction market dynamics on Polymarket. It provides six tasks spanning two tiers:
+EventX connects social media posts on Twitter/X to prediction market dynamics on Polymarket. It provides seven tasks spanning two tiers:
 
 - **Resolution tier** (human-annotated): Post-to-Market Linking (T2), Evidence Grading (T3)
 - **Forecast tier** (deterministic labels): Market Volume Prediction (T1), Market Movement Prediction (T4), Impact Persistence (T5), Cross-Market Propagation (T6)
@@ -44,8 +44,9 @@ EventX connects social media posts on Twitter/X to prediction market dynamics on
 | `t2` | Post-to-Market Linking | 815 | Match a tweet to the correct prediction market |
 | `t3` | Evidence Grading | 342,552 | Grade tweet relevance to a market (0-5) |
 | `t4` | Market Movement Prediction | 4,803 | Predict price direction and magnitude at 2h horizon |
-| `t5` | Volume & Price Impact | 407 (268 clean) | Predict price_impact, volume_multiplier, and decay class |
+| `t5` | Volume & Price Impact | 407 (268 clean) | Predict price_impact and volume_multiplier (continuous) |
 | `t6` | Cross-Market Propagation | 4,006 | Predict spillover to sibling markets |
+| `t7` | Impact Persistence (Decay) | 407 (268 clean) | Classify decay: transient/sustained/reversal |
 | `posts` | Tweet Metadata | ~9M | Tweet IDs (text stripped for privacy) |
 | `markets` | Market Metadata | -- | Market questions, categories, resolution info |
 | `ohlcv` | Market OHLCV | -- | Price/volume time series |
@@ -142,17 +143,6 @@ ohlcv = load_dataset("mlsys-io/EventXBench", "ohlcv")
 - **Tweet text**: Stripped from the public release per Twitter/X ToS. Tweet IDs are provided for authorized rehydration.
 - **Market data**: Polymarket data is publicly available on-chain and included under fair use for research.
 - **No PII**: User-level features are aggregated; no individual user profiles are released.
-
-## Citation
-
-```bibtex
-@inproceedings{eventx2026,
-  title     = {EventX: A Multimodal Benchmark Linking Social Media Posts to Prediction Market Dynamics},
-  author    = {TODO},
-  booktitle = {Proceedings of the ACM International Conference on Multimedia (MM '26)},
-  year      = {2026},
-}
-```
 
 ## License
 

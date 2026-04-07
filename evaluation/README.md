@@ -1,6 +1,6 @@
 # EventX Evaluation
 
-Unified evaluation module for all six EventX tasks.
+Unified evaluation module for all seven EventX tasks.
 
 ## Quick Start
 
@@ -82,6 +82,16 @@ Decay labels: `transient`, `sustained`, `reversal`. Continuous targets: `price_i
 Labels: `no_effect`, `primary_mover`, `propagated_signal`
 
 **Primary metric:** Macro-F1 | **Secondary:** MAE on onset lag (minutes)
+
+### T7 -- Impact Persistence (Decay Classification)
+
+```json
+{"tweet_id": 123456789, "condition_id": "0x1234abcd", "label": "sustained"}
+```
+
+Labels: `transient`, `sustained`, `reversal`
+
+**Primary metric:** Macro-F1
 
 ## Using Metrics Programmatically
 

@@ -1,5 +1,7 @@
 # EventX: A Multimodal Benchmark Linking Social Media Posts to Prediction Market Dynamics
 
+**Dataset: [https://huggingface.co/datasets/mlsys-io/EventXBench](https://huggingface.co/datasets/mlsys-io/EventXBench)**
+
 [![Dataset on HF](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-EventXBench-blue)](https://huggingface.co/datasets/mlsys-io/EventXBench)
 [![Paper](https://img.shields.io/badge/Paper-ACM%20MM%20'26-red)](https://doi.org/PLACEHOLDER)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
@@ -194,17 +196,6 @@ EventXBench/
 ## Leaderboard
 
 See [LEADERBOARD.md](LEADERBOARD.md) for current results. To submit, open a pull request.
-
-## Citation
-
-```bibtex
-@inproceedings{eventx2026,
-  title     = {EventX: A Multimodal Benchmark Linking Social Media Posts to Prediction Market Dynamics},
-  author    = {TODO},
-  booktitle = {Proceedings of the ACM International Conference on Multimedia (MM '26)},
-  year      = {2026},
-}
-```
 
 ## License
 
