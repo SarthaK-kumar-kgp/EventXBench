@@ -40,7 +40,7 @@ EventX connects social media posts on Twitter/X to prediction market dynamics on
 
 | Config | Task | Rows | Description |
 |--------|------|------|-------------|
-| `t1` | Market Volume Prediction | 305 | Predict eventual trading volume from pre-market tweets |
+| `t1` | Market Volume Prediction | 326 | Predict eventual trading volume from pre-market tweets |
 | `t2` | Post-to-Market Linking | 815 | Match a tweet to the correct prediction market |
 | `t3` | Evidence Grading | 342,552 | Grade tweet relevance to a market (0-5) |
 | `t4` | Market Movement Prediction | 4,803 | Predict price direction and magnitude at 2h horizon |

@@ -27,7 +27,7 @@ python evaluation/evaluate.py --task t1 --predictions results/t1_predictions.jso
 
 | Task | Name | Tier | Output | Instances | Primary Metrics |
 |------|------|------|--------|-----------|-----------------|
-| T1 | Market Volume Prediction | Forecast | 3-class (`high`/`moderate`/`low`) | 305 | Macro-F1, `high`-class P@K |
+| T1 | Market Volume Prediction | Forecast | 3-class (`high`/`moderate`/`low`) | 326 | Macro-F1, `high`-class P@K |
 | T2 | Post-to-Market Linking | Resolution | Market ID or `none` | 815 | Accuracy@1, MRR |
 | T3 | Evidence Grading | Resolution | Ordinal 0--5 | 342,552 | QWK (kappa), macro-F1 |
 | T4 | Market Movement Prediction | Forecast | Direction x Magnitude | 4,803 | Dir-Acc, Mag-F1, Spearman rho |
@@ -109,7 +109,7 @@ See [`data/README.md`](data/README.md) for the full dataset card.
 | `posts_no_text.jsonl` | Tweet IDs and metadata (text stripped for privacy) | ~9M rows |
 | `market_fundamental.json` | Market metadata (question, category, resolution) | 11,952 markets |
 | `market_ohlcv.json` | Price/volume time series (OHLCV) | 1.8 GB |
-| `t1_labels.jsonl` | T1 ground truth with train/test splits | 305 |
+| `t1_labels.jsonl` | T1 ground truth with train/test splits | 326 |
 | `t2_groundtruth.jsonl` | T2 post-market linking pairs | 815 |
 | `t3_graded.json` | T3 evidence grades (0--5) | 342,552 |
 | `t4_labels.jsonl` | T4 direction x magnitude labels | 4,803 |
