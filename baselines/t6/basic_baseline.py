@@ -18,7 +18,7 @@ import pandas as pd
 
 import eventxbench
 
-LABEL_ORDER = ["no_cross_market_effect", "cross_market_effect", "insufficient_data"]
+LABEL_ORDER = ["no_cross_market_effect", "primary_mover", "propagated_signal"]
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +53,14 @@ def _majority_baseline(y_true: list[str], labels: list[str]) -> dict:
     }
 
 
-def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | None = None) -> dict:
+def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | None = None, train_labels: list[str] | None = None) -> dict:
     if seeds is None:
         seeds = [13, 42, 123]
 
-    counts = Counter(y_true)
+    prior_source = train_labels if train_labels is not None else y_true
+    counts = Counter(prior_source)
     total = len(y_true)
-    priors = np.array([counts.get(lab, 0) / total for lab in labels])
+    priors = np.array([counts.get(lab, 0) / len(prior_source) for lab in labels])
 
     f1_scores = []
     for seed in seeds:
@@ -82,45 +83,54 @@ def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | No
 def main() -> None:
     parser = argparse.ArgumentParser(description="T6 basic baselines")
     parser.add_argument("--local-dir", default=None)
-    parser.add_argument(
-        "--exclude-insufficient",
-        action="store_true",
-        help="Exclude rows with insufficient_data label",
-    )
+    parser.add_argument("--feature-file", default=None,
+                        help="Path to feature JSONL with split column (e.g. t6_db_features.jsonl)")
     args = parser.parse_args()
 
-    data = eventxbench.load_task("t6", local_dir=args.local_dir)
-    if isinstance(data, tuple):
-        _, df = data
+    if args.feature_file:
+        full_df = pd.read_json(args.feature_file, lines=True)
+        full_df = full_df[full_df["insufficient_data_flag"] == False].copy()
+        full_df = full_df[full_df["label"].isin(LABEL_ORDER)].copy()
+        train_df = full_df[full_df["split"] == "train"].copy()
+        test_df = full_df[(full_df["split"] == "test") & (full_df["confound_flag"] == False)].copy()
     else:
-        df = data
+        data = eventxbench.load_task("t6", local_dir=args.local_dir)
+        if isinstance(data, tuple):
+            train_df, test_df = data
+            full_df = pd.concat([train_df, test_df], ignore_index=True)
+        else:
+            full_df = data
 
-    # Filter
-    if "insufficient_data_flag" in df.columns:
-        df = df[df["insufficient_data_flag"] == False].reset_index(drop=True)
-    if "confound_flag" in df.columns:
-        df = df[df["confound_flag"] == False].reset_index(drop=True)
+        if "insufficient_data_flag" in full_df.columns:
+            full_df = full_df[full_df["insufficient_data_flag"] == False].reset_index(drop=True)
+        full_df = full_df[full_df["label"].isin(LABEL_ORDER)].reset_index(drop=True)
 
-    df = df[df["label"].isin(LABEL_ORDER)].reset_index(drop=True)
+        if "split" in full_df.columns:
+            train_df = full_df[full_df["split"] == "train"].copy()
+            test_df = full_df[full_df["split"] == "test"].copy()
+        else:
+            split_idx = int(len(full_df) * 0.8)
+            train_df = full_df.iloc[:split_idx].copy()
+            test_df = full_df.iloc[split_idx:].copy()
 
-    if args.exclude_insufficient:
-        df = df[df["label"] != "insufficient_data"].reset_index(drop=True)
-        eval_labels = [l for l in LABEL_ORDER if l != "insufficient_data"]
-    else:
-        eval_labels = LABEL_ORDER
+        if "confound_flag" in test_df.columns:
+            test_df = test_df[test_df["confound_flag"] == False].reset_index(drop=True)
 
-    y_true = df["label"].tolist()
+    eval_labels = LABEL_ORDER
+    y_true = test_df["label"].tolist()
 
-    print(f"T6 samples: {len(y_true)}")
-    print(f"Class distribution: {dict(Counter(y_true))}")
+    print(f"T6 train: {len(train_df)}, test: {len(test_df)}")
+    print(f"Test class distribution: {dict(Counter(y_true))}")
 
-    # Majority baseline
-    maj = _majority_baseline(y_true, eval_labels)
-    print(f"\n[Majority] always predict '{maj['majority_label']}'")
-    print(f"  Macro-F1: {maj['macro_f1']:.4f}")
+    # Majority baseline (majority from train)
+    majority_label = train_df["label"].value_counts().idxmax()
+    y_pred_maj = [majority_label] * len(y_true)
+    mf1_maj = _macro_f1(y_true, y_pred_maj, eval_labels)
+    print(f"\n[Majority] always predict '{majority_label}'")
+    print(f"  Macro-F1: {mf1_maj:.4f}")
 
-    # Random baseline
-    rand = _random_baseline(y_true, eval_labels)
+    # Random baseline (priors from train)
+    rand = _random_baseline(y_true, eval_labels, train_labels=train_df["label"].tolist())
     print(f"\n[Random Prior] sample from training distribution")
     print(f"  Mean Macro-F1: {rand['mean_macro_f1']:.4f}")
     print(f"  Per-seed: {rand['per_seed_macro_f1']}")

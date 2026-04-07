@@ -28,7 +28,7 @@ LABELS = ["no_cross_market_effect", "primary_mover", "propagated_signal"]
 # ---------------------------------------------------------------------------
 TASK_DESCRIPTION = """\
 Cross-market propagation classification:
-- no_cross_market_effect: The tweet affected only the primary market; sibling markets were unaffected.
+- no_effect: The tweet affected only the primary market; sibling markets were unaffected.
 - primary_mover: The tweet's impact on the primary market propagated to sibling markets.
 - propagated_signal: The market movement was a propagated signal from another market."""
 
@@ -198,11 +198,6 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.3)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local-dir", default=None)
-    parser.add_argument(
-        "--exclude-insufficient",
-        action="store_true",
-        help="Exclude rows with insufficient_data label",
-    )
     args = parser.parse_args()
 
     # -- Load data ----------------------------------------------------------
@@ -217,12 +212,7 @@ def main() -> None:
 
     # Filter to valid labels
     df = df[df["label"].isin(LABELS)].reset_index(drop=True)
-
-    if args.exclude_insufficient:
-        df = df[df["label"] != "insufficient_data"].reset_index(drop=True)
-        eval_labels = [l for l in LABELS if l != "insufficient_data"]
-    else:
-        eval_labels = LABELS
+    eval_labels = LABELS
 
     # Optionally filter out confounded rows
     if "confound_flag" in df.columns:

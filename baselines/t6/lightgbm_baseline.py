@@ -24,7 +24,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 import eventxbench
 
-LABEL_ORDER = ["no_cross_market_effect", "cross_market_effect", "insufficient_data"]
+LABEL_ORDER = ["no_cross_market_effect", "primary_mover", "propagated_signal"]
 LABEL_TO_ID = {label: idx for idx, label in enumerate(LABEL_ORDER)}
 RANDOM_STATE = 42
 N_TRIALS = 20
@@ -70,11 +70,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="T6 LightGBM cross-market baseline")
     parser.add_argument("--n-trials", type=int, default=N_TRIALS)
     parser.add_argument("--local-dir", default=None)
-    parser.add_argument(
-        "--exclude-insufficient",
-        action="store_true",
-        help="Exclude rows with insufficient_data label",
-    )
     args = parser.parse_args()
 
     # -- Load data ----------------------------------------------------------
@@ -88,17 +83,7 @@ def main() -> None:
         train_df = df.iloc[:split_idx].reset_index(drop=True)
         test_df = df.iloc[split_idx:].reset_index(drop=True)
 
-    # Filter insufficient_data_flag if present
-    if "insufficient_data_flag" in train_df.columns:
-        train_df = train_df[train_df["insufficient_data_flag"] == False].copy()
-        test_df = test_df[test_df["insufficient_data_flag"] == False].copy()
-
-    if args.exclude_insufficient:
-        train_df = train_df[train_df["label"] != "insufficient_data"].copy()
-        test_df = test_df[test_df["label"] != "insufficient_data"].copy()
-        label_order = [l for l in LABEL_ORDER if l != "insufficient_data"]
-    else:
-        label_order = LABEL_ORDER
+    label_order = LABEL_ORDER
 
     label_to_id = {lab: i for i, lab in enumerate(label_order)}
 
