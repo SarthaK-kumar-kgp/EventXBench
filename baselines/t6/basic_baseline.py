@@ -14,11 +14,11 @@ import argparse
 from collections import Counter
 
 import numpy as np
-import pandas as pd
 
-import eventxbench
-
-LABEL_ORDER = ["no_cross_market_effect", "cross_market_effect", "insufficient_data"]
+try:
+    from .data_utils import LABEL_ORDER, load_t6_dataframe, train_eval_frames
+except ImportError:
+    from data_utils import LABEL_ORDER, load_t6_dataframe, train_eval_frames
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +53,14 @@ def _majority_baseline(y_true: list[str], labels: list[str]) -> dict:
     }
 
 
-def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | None = None) -> dict:
+def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | None = None, train_labels: list[str] | None = None) -> dict:
     if seeds is None:
         seeds = [13, 42, 123]
 
-    counts = Counter(y_true)
+    prior_source = train_labels if train_labels is not None else y_true
+    counts = Counter(prior_source)
     total = len(y_true)
-    priors = np.array([counts.get(lab, 0) / total for lab in labels])
+    priors = np.array([counts.get(lab, 0) / len(prior_source) for lab in labels])
 
     f1_scores = []
     for seed in seeds:
@@ -81,46 +82,43 @@ def _random_baseline(y_true: list[str], labels: list[str], seeds: list[int] | No
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="T6 basic baselines")
+    parser.add_argument("--repo", default="mlsys-io/EventXBench")
     parser.add_argument("--local-dir", default=None)
+    parser.add_argument("--feature-file", default=None,
+                        help="Path to feature JSONL with split column (e.g. t6_db_features.jsonl)")
     parser.add_argument(
-        "--exclude-insufficient",
-        action="store_true",
-        help="Exclude rows with insufficient_data label",
+        "--eval-split",
+        choices=["val", "test", "all"],
+        default="test",
+        help="Evaluation split. Use 'all' only for reproducing all-clean LLM-style runs.",
     )
+    parser.add_argument("--include-confounded-eval", action="store_true")
+    parser.add_argument("--include-insufficient", action="store_true")
     args = parser.parse_args()
 
-    data = eventxbench.load_task("t6", local_dir=args.local_dir)
-    if isinstance(data, tuple):
-        _, df = data
-    else:
-        df = data
+    full_df = load_t6_dataframe(args.feature_file, args.local_dir, repo=args.repo)
+    train_df, test_df = train_eval_frames(
+        full_df,
+        eval_split=args.eval_split,
+        include_confounded_eval=args.include_confounded_eval,
+        include_insufficient=args.include_insufficient,
+    )
 
-    # Filter
-    if "insufficient_data_flag" in df.columns:
-        df = df[df["insufficient_data_flag"] == False].reset_index(drop=True)
-    if "confound_flag" in df.columns:
-        df = df[df["confound_flag"] == False].reset_index(drop=True)
+    eval_labels = LABEL_ORDER
+    y_true = test_df["label"].tolist()
 
-    df = df[df["label"].isin(LABEL_ORDER)].reset_index(drop=True)
+    print(f"T6 train: {len(train_df)}, test: {len(test_df)}")
+    print(f"Test class distribution: {dict(Counter(y_true))}")
 
-    if args.exclude_insufficient:
-        df = df[df["label"] != "insufficient_data"].reset_index(drop=True)
-        eval_labels = [l for l in LABEL_ORDER if l != "insufficient_data"]
-    else:
-        eval_labels = LABEL_ORDER
+    # Majority baseline (majority from train)
+    majority_label = train_df["label"].value_counts().idxmax()
+    y_pred_maj = [majority_label] * len(y_true)
+    mf1_maj = _macro_f1(y_true, y_pred_maj, eval_labels)
+    print(f"\n[Majority] always predict '{majority_label}'")
+    print(f"  Macro-F1: {mf1_maj:.4f}")
 
-    y_true = df["label"].tolist()
-
-    print(f"T6 samples: {len(y_true)}")
-    print(f"Class distribution: {dict(Counter(y_true))}")
-
-    # Majority baseline
-    maj = _majority_baseline(y_true, eval_labels)
-    print(f"\n[Majority] always predict '{maj['majority_label']}'")
-    print(f"  Macro-F1: {maj['macro_f1']:.4f}")
-
-    # Random baseline
-    rand = _random_baseline(y_true, eval_labels)
+    # Random baseline (priors from train)
+    rand = _random_baseline(y_true, eval_labels, train_labels=train_df["label"].tolist())
     print(f"\n[Random Prior] sample from training distribution")
     print(f"  Mean Macro-F1: {rand['mean_macro_f1']:.4f}")
     print(f"  Per-seed: {rand['per_seed_macro_f1']}")
