@@ -109,7 +109,7 @@ See [`data/README.md`](data/README.md) for the full dataset card.
 | `posts_no_text.jsonl` | Tweet IDs and metadata (text stripped for privacy) | ~9M rows |
 | `market_fundamental.json` | Market metadata (question, category, resolution) | 11,952 markets |
 | `market_ohlcv.json` | Price/volume time series (OHLCV) | 1.8 GB |
-| `t1_labels.jsonl` | T1 ground truth with train/test splits | 305 |
+| `t1_labels.jsonl` | T1 ground truth with train/test splits | 326 |
 | `t2_groundtruth.jsonl` | T2 post-market linking pairs | 815 |
 | `t3_graded.json` | T3 evidence grades (0--5) | 342,552 |
 | `t4_labels.jsonl` | T4 direction x magnitude labels | 4,803 |
