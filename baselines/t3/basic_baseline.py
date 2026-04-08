@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""T3 Basic Baselines -- Evidence Grading.
+"""T3 Pre-check Pipeline Baseline -- Evidence Grading.
 
-Evaluates majority-class and random baselines for T3 evidence grading.
-Reports Spearman correlation and Quadratic Weighted Kappa (QWK).
+Evaluates majority-class, random, and pre-check pipeline baselines
+for T3 evidence grading using a market-level 70/30 train-test split.
+Reports Cohen's Kappa and Macro F1.
 
 Usage:
-    python -m baselines.t3.basic_baseline
-    python -m baselines.t3.basic_baseline --local-dir /path/to/data
+    python t3_precheck_baseline.py
+    python t3_precheck_baseline.py --local-dir /path/to/data
 """
 from __future__ import annotations
 
@@ -15,109 +16,91 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import cohen_kappa_score, f1_score
+from sklearn.model_selection import train_test_split
 
 import eventxbench
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Train/test split
 # ---------------------------------------------------------------------------
-def _spearman(x: list[float], y: list[float]) -> float | None:
-    n = len(x)
-    if n < 2:
-        return None
-
-    def _rank(vals):
-        indexed = sorted(enumerate(vals), key=lambda p: p[1])
-        ranks = [0.0] * len(vals)
-        i = 0
-        while i < len(indexed):
-            j = i
-            while j + 1 < len(indexed) and indexed[j + 1][1] == indexed[i][1]:
-                j += 1
-            avg = (i + j + 2) / 2.0
-            for k in range(i, j + 1):
-                ranks[indexed[k][0]] = avg
-            i = j + 1
-        return ranks
-
-    rx, ry = _rank(x), _rank(y)
-    mx = sum(rx) / n
-    my = sum(ry) / n
-    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
-    vx = sum((a - mx) ** 2 for a in rx)
-    vy = sum((b - my) ** 2 for b in ry)
-    if vx == 0 or vy == 0:
-        return None
-    return cov / (vx ** 0.5 * vy ** 0.5)
-
-
-def _quadratic_weighted_kappa(y_true: list[int], y_pred: list[int], num_classes: int = 6) -> float:
-    n = len(y_true)
-    if n == 0:
-        return 0.0
-    O = np.zeros((num_classes, num_classes), dtype=float)
-    for t, p in zip(y_true, y_pred):
-        O[t][p] += 1
-    W = np.zeros((num_classes, num_classes), dtype=float)
-    for i in range(num_classes):
-        for j in range(num_classes):
-            W[i][j] = (i - j) ** 2 / (num_classes - 1) ** 2
-    hist_true = O.sum(axis=1)
-    hist_pred = O.sum(axis=0)
-    E = np.outer(hist_true, hist_pred) / n
-    num = (W * O).sum()
-    den = (W * E).sum()
-    if den == 0:
-        return 1.0
-    return 1.0 - num / den
+def split_by_market(
+    df: pd.DataFrame, test_size: float = 0.3, random_state: int = 42
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    markets = df["condition_id"].unique()
+    train_markets, test_markets = train_test_split(
+        markets, test_size=test_size, random_state=random_state
+    )
+    train_df = df[df["condition_id"].isin(train_markets)].copy()
+    test_df = df[df["condition_id"].isin(test_markets)].copy()
+    return train_df, test_df
 
 
 # ---------------------------------------------------------------------------
 # Baselines
 # ---------------------------------------------------------------------------
-def _run_majority(y_true: list[int]) -> dict:
-    counts = Counter(y_true)
-    majority = counts.most_common(1)[0][0]
-    y_pred = [majority] * len(y_true)
-    rho = _spearman([float(v) for v in y_true], [float(v) for v in y_pred])
-    qwk = _quadratic_weighted_kappa(y_true, y_pred)
+def _run_majority(y_true: np.ndarray) -> dict:
+    counts = Counter(y_true.tolist())
+    majority_class = counts.most_common(1)[0][0]
+    y_pred = np.full(len(y_true), majority_class)
+
+    kappa = cohen_kappa_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
     return {
         "baseline": "majority",
-        "majority_grade": majority,
+        "majority_class": majority_class,
         "n": len(y_true),
-        "spearman": rho,
-        "qwk": qwk,
+        "kappa": kappa,
+        "macro_f1": f1,
     }
 
 
-def _run_random(y_true: list[int], seeds: list[int] | None = None) -> dict:
+def _run_random(y_true: np.ndarray, seeds: list[int] | None = None) -> dict:
     if seeds is None:
         seeds = [13, 42, 123]
 
-    counts = Counter(y_true)
+    counts = Counter(y_true.tolist())
     grades = sorted(counts.keys())
     total = sum(counts.values())
     priors = np.array([counts[g] / total for g in grades])
 
-    rhos: list[float] = []
-    qwks: list[float] = []
+    kappas: list[float] = []
+    f1s: list[float] = []
 
     for seed in seeds:
         rng = np.random.default_rng(seed)
-        y_pred = rng.choice(grades, size=len(y_true), p=priors).tolist()
-        rho = _spearman([float(v) for v in y_true], [float(v) for v in y_pred])
-        qwk = _quadratic_weighted_kappa(y_true, y_pred)
-        if rho is not None:
-            rhos.append(rho)
-        qwks.append(qwk)
+        y_pred = rng.choice(grades, size=len(y_true), p=priors)
+        kappas.append(cohen_kappa_score(y_true, y_pred))
+        f1s.append(f1_score(y_true, y_pred, average="macro", zero_division=0))
 
     return {
         "baseline": "random_prior",
         "seeds": seeds,
         "n": len(y_true),
-        "mean_spearman": float(np.mean(rhos)) if rhos else None,
-        "mean_qwk": float(np.mean(qwks)),
+        "mean_kappa": float(np.mean(kappas)),
+        "mean_macro_f1": float(np.mean(f1s)),
+    }
+
+
+def _run_precheck_pipeline(test_df: pd.DataFrame) -> dict:
+    """Use llm_grade as prediction, filling NaNs with majority class (3)."""
+    df = test_df.copy()
+    df["candidate_grade_filled"] = df["llm_grade"].fillna(3).astype(int)
+
+    y_true = df["final_grade"].values
+    y_pred = df["candidate_grade_filled"].values
+
+    kappa = cohen_kappa_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    return {
+        "baseline": "precheck_pipeline",
+        "n": len(y_true),
+        "nan_fill_value": 3,
+        "kappa": kappa,
+        "macro_f1": f1,
     }
 
 
@@ -125,30 +108,45 @@ def _run_random(y_true: list[int], seeds: list[int] | None = None) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="T3 basic baselines")
+    parser = argparse.ArgumentParser(description="T3 pre-check pipeline baselines")
     parser.add_argument("--local-dir", default=None)
+    parser.add_argument("--test-size", type=float, default=0.3)
+    parser.add_argument("--random-state", type=int, default=42)
     args = parser.parse_args()
 
+    # Load data
     df = eventxbench.load_task("t3", local_dir=args.local_dir)
     if isinstance(df, tuple):
         df = df[1]
 
-    y_true = df["final_grade"].astype(int).tolist()
+    df.sort_values(by=["createdAt"], ascending=True, inplace=True)
 
-    print(f"T3 samples: {len(y_true)}")
-    print(f"Grade distribution: {dict(sorted(Counter(y_true).items()))}")
+    # Split
+    train_df, test_df = split_by_market(
+        df, test_size=args.test_size, random_state=args.random_state
+    )
+
+    y_true = test_df["final_grade"].values
+
+    print(f"T3 samples: {len(df)}")
+    print(f"Train set size: {len(train_df)}")
+    print(f"Test set size:  {len(test_df)}")
+    print(f"Grade distribution (test): {dict(sorted(Counter(y_true.tolist()).items()))}")
 
     # Majority baseline
     maj = _run_majority(y_true)
-    rho_str = f"{maj['spearman']:.4f}" if maj["spearman"] is not None else "N/A"
-    print(f"\n[Majority] always predict grade={maj['majority_grade']}")
-    print(f"  Spearman={rho_str}, QWK={maj['qwk']:.4f}")
+    print(f"\n[Majority] always predict grade={maj['majority_class']}")
+    print(f"  Kappa={maj['kappa']:.4f}, Macro F1={maj['macro_f1']:.4f}")
 
     # Random baseline
     rand = _run_random(y_true)
-    rho_str = f"{rand['mean_spearman']:.4f}" if rand["mean_spearman"] is not None else "N/A"
-    print(f"\n[Random Prior] sample from training distribution")
-    print(f"  Mean Spearman={rho_str}, Mean QWK={rand['mean_qwk']:.4f}")
+    print(f"\n[Random Prior] sample from training distribution (seeds={rand['seeds']})")
+    print(f"  Mean Kappa={rand['mean_kappa']:.4f}, Mean Macro F1={rand['mean_macro_f1']:.4f}")
+
+    # Pre-check pipeline baseline
+    pre = _run_precheck_pipeline(test_df)
+    print(f"\n[Pre-check Pipeline] use llm_grade (NaN → {pre['nan_fill_value']})")
+    print(f"  Kappa={pre['kappa']:.4f}, Macro F1={pre['macro_f1']:.4f}")
 
 
 if __name__ == "__main__":
