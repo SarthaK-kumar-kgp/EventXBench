@@ -80,7 +80,10 @@ def _load_jsonl(path: Path) -> pd.DataFrame:
 _HF_LAYOUT = {
     "t1": {"train": "t1/train.jsonl", "test": "t1/test.jsonl"},
     "t2": {"test": "t2/test.jsonl"},
-    "t3": {"test": "t3/test.jsonl"},
+    # "test" = full silver-labeled export (`final_grade`, label_source auto/llm).
+    # "gold" = the separate, rare-grade-enriched, human-adjudicated audit pool
+    # (`gold_grade`) - NOT a natural-distribution test split, see T3_Reproducible_Package.
+    "t3": {"test": "t3/test.jsonl", "gold": "t3/gold.jsonl"},
     "t4": {"train": "t4/train.jsonl", "test": "t4/test.jsonl"},
     "t5": {"train": "t5/train.jsonl", "test": "t5/test.jsonl"},
     "t6": {
@@ -100,7 +103,7 @@ _RAW_LAYOUT = {
         "test": "task1/groundtruth/t1_market_level_test_premarket_only_new.jsonl",
     },
     "t2": {"test": "task2/t2_groundtruth.jsonl"},
-    "t3": {"test": "task3/t3_final_graded.json"},
+    "t3": {"test": "task3/t3_final_graded.json", "gold": "task3/t3_gold_pool.json"},
     "t4": {"full": "task4/t4_labels.jsonl"},
     "t5": {"full": "task5+7/t5(7)_label.jsonl"},
     "t6": {

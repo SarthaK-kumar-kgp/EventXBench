@@ -42,7 +42,7 @@ EventX connects social media posts on Twitter/X to prediction market dynamics on
 |--------|------|------|-------------|
 | `t1` | Market Volume Prediction | 326 | Predict eventual trading volume from pre-market tweets |
 | `t2` | Post-to-Market Linking | 815 | Match a tweet to the correct prediction market |
-| `t3` | Evidence Grading | 342,552 | Grade tweet relevance to a market (0-5) |
+| `t3` | Evidence Grading | 279,924 (`test`, silver) + 2,687 (`gold`, human-adjudicated) | Grade tweet relevance to a market (0-5) |
 | `t4` | Market Movement Prediction | 4,803 | Predict price direction and magnitude at 2h horizon |
 | `t5` | Volume & Price Impact | 407 (268 clean) | Predict price_impact and volume_multiplier (continuous) |
 | `t6` | Cross-Market Propagation | 4,006 | Predict spillover to sibling markets |
@@ -93,14 +93,32 @@ ohlcv = load_dataset("mlsys-io/EventXBench", "ohlcv")
 
 ### T3: Evidence Grading
 
+Two splits, not interchangeable ground truth: `test` is the full silver
+export (279,924 rows); `gold` is a separate, rare-grade-enriched,
+human-adjudicated audit pool (2,687 rows) sampled from the silver export.
+Silver agrees with gold at only kappa_w=0.582 (fails the project's own 0.6
+reliability bar) - see the T3_Reproducible_Package `metrics.md`, Phase 6.
+
+`test` (silver) split:
 - `tweet_id` (int): Twitter post ID
 - `condition_id` (str): Polymarket condition ID
 - `tweet` (str): Tweet text
-- `market` (str): Market metadata
 - `question` (str): Market question
-- `final_grade` (int): Evidence grade 0-5
-- `llm_grade` (int): LLM-assigned grade
+- `description` (str): Raw resolution rule text
+- `predicate` (str): GPT-derived, condensed resolution condition
+- `deadline` (str): Market resolution deadline
+- `requires_official` (bool): Whether an official/whitelisted source is required for grade 5
+- `final_grade` (int): Evidence grade 0-5 (silver, not human-adjudicated)
+- `label_source` (str): `auto` (all 4 deterministic checks passed) or `llm` (model-graded) -
+  **no `human` value exists in this split**; human annotation only occurs in the separate `gold` split below
+- `llm_grade` (int): LLM-assigned grade (NaN for `auto` rows)
 - `llm_confidence` (float): LLM confidence score
+
+`gold` (human-adjudicated audit pool) split:
+- `tweet_id`, `condition_id`: as above
+- `gold_grade` (int): Evidence grade 0-5, resolved from 3 independent human annotators
+  via majority vote / pair agreement / senior adjudication
+- `resolution_method` (str): `majority_vote_2of3`, `pair_agreement`, or `senior_adjudication`
 
 ### T4: Market Movement Prediction
 
