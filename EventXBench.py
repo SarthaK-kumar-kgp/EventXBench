@@ -30,6 +30,53 @@ _DESCRIPTION = (
 _HOMEPAGE = "https://github.com/mlsys-io/EventXBench"
 _LICENSE = "cc-by-nc-4.0"
 
+# T3 needs an explicit schema (unlike every other config, which still relies
+# on auto-inference from the first write batch). Its "train" split's first
+# ~2,325 rows are a contiguous run of `auto`-labeled rows (all four
+# deterministic checks passed), so llm_grade/llm_confidence/threshold/all the
+# flag columns are 100% null in that first batch. datasets' auto-inference
+# would lock those in as an untyped null column, then crash the moment a real
+# value shows up later ("Couldn't cast array of type string to null"). This is
+# the union of "train" and "gold" columns; missing keys per-split are filled
+# null automatically by the Arrow writer once features are explicit.
+T3_FEATURES = datasets.Features(
+    {
+        "tweet_id": datasets.Value("int64"),
+        "condition_id": datasets.Value("string"),
+        "tweet": datasets.Value("string"),
+        "question": datasets.Value("string"),
+        "description": datasets.Value("string"),
+        "predicate": datasets.Value("string"),
+        "requires_official": datasets.Value("bool"),
+        # train-only
+        "deadline": datasets.Value("string"),
+        "threshold": datasets.Value("string"),
+        "final_grade": datasets.Value("float64"),
+        "label_source": datasets.Value("string"),
+        "candidate_grade": datasets.Value("float64"),
+        "llm_grade": datasets.Value("float64"),
+        "llm_confidence": datasets.Value("float64"),
+        "check_source": datasets.Value("string"),
+        "check_time": datasets.Value("string"),
+        "check_threshold": datasets.Value("string"),
+        "check_predicate": datasets.Value("string"),
+        "needs_llm": datasets.Value("bool"),
+        "predicate_satisfied": datasets.Value("bool"),
+        "flag_conditional": datasets.Value("bool"),
+        "flag_sarcasm": datasets.Value("bool"),
+        "flag_source_unclear": datasets.Value("bool"),
+        "flag_threshold_ambiguous": datasets.Value("bool"),
+        "needs_human_review": datasets.Value("bool"),
+        "created_at": datasets.Value("string"),
+        # gold-only
+        "gold_grade": datasets.Value("int64"),
+        "resolution_method": datasets.Value("string"),
+        "A1_grade": datasets.Value("float64"),
+        "A2_grade": datasets.Value("float64"),
+        "A3_grade": datasets.Value("float64"),
+    }
+)
+
 _URLS = {
     "t1_train": "data/t1/train.jsonl",
     "t1_test": "data/t1/test.jsonl",
@@ -106,11 +153,13 @@ class EventXBench(datasets.GeneratorBasedBuilder):
     DEFAULT_CONFIG_NAME = "t1"
 
     def _info(self):
-        # Use generic features since each task has different schemas.
-        # HF will infer the schema from the first batch of examples.
+        # Every other config still relies on auto-inference from the first
+        # write batch (features=None) - unchanged, verified safe. T3 alone
+        # needs an explicit schema; see T3_FEATURES above for why.
+        features = T3_FEATURES if self.config.name == "t3" else None
         return datasets.DatasetInfo(
             description=_DESCRIPTION,
-            features=None,  # auto-inferred from data
+            features=features,
             homepage=_HOMEPAGE,
             license=_LICENSE,
         )
