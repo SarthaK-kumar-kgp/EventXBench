@@ -62,6 +62,9 @@ def _load_hf(task: str, repo: str, split: Optional[str]):
         return ds["train"].to_pandas(), ds["test"].to_pandas()
     elif "test" in splits:
         return ds["test"].to_pandas()
+    elif "train" in splits:
+        # e.g. T3: {train, gold} - no "test" split exists at all.
+        return ds["train"].to_pandas()
     else:
         return ds[splits[0]].to_pandas()
 
@@ -80,10 +83,12 @@ def _load_jsonl(path: Path) -> pd.DataFrame:
 _HF_LAYOUT = {
     "t1": {"train": "t1/train.jsonl", "test": "t1/test.jsonl"},
     "t2": {"test": "t2/test.jsonl"},
-    # "test" = full silver-labeled export (`final_grade`, label_source auto/llm).
+    # "train" = full silver-labeled export (`final_grade`, label_source auto/llm).
+    # Named "train" (not "test") because baselines self-split it 70/30 by
+    # condition_id at runtime rather than treating it as a held-out set.
     # "gold" = the separate, rare-grade-enriched, human-adjudicated audit pool
-    # (`gold_grade`) - NOT a natural-distribution test split, see T3_Reproducible_Package.
-    "t3": {"test": "t3/test.jsonl", "gold": "t3/gold.jsonl"},
+    # (`gold_grade`) - the actual held-out ground truth, see T3_Reproducible_Package.
+    "t3": {"train": "t3/train.jsonl", "gold": "t3/gold.jsonl"},
     "t4": {"train": "t4/train.jsonl", "test": "t4/test.jsonl"},
     "t5": {"train": "t5/train.jsonl", "test": "t5/test.jsonl"},
     "t6": {
@@ -103,7 +108,7 @@ _RAW_LAYOUT = {
         "test": "task1/groundtruth/t1_market_level_test_premarket_only_new.jsonl",
     },
     "t2": {"test": "task2/t2_groundtruth.jsonl"},
-    "t3": {"test": "task3/t3_final_graded.json", "gold": "task3/t3_gold_pool.json"},
+    "t3": {"train": "task3/t3_final_graded.json", "gold": "task3/t3_gold_pool.json"},
     "t4": {"full": "task4/t4_labels.jsonl"},
     "t5": {"full": "task5+7/t5(7)_label.jsonl"},
     "t6": {
@@ -179,8 +184,14 @@ def _load_hf_layout(task: str, data_dir: Path, split: Optional[str]):
 
     if "train" in files and "test" in files:
         return _load_jsonl(data_dir / files["train"]), _load_jsonl(data_dir / files["test"])
+    if "test" in files:
+        return _load_jsonl(data_dir / files["test"])
+    if "train" in files:
+        # e.g. T3: {train, gold} - no "test" split exists at all.
+        return _load_jsonl(data_dir / files["train"])
 
-    return _load_jsonl(data_dir / files["test"])
+    first_key = next(iter(files))
+    return _load_jsonl(data_dir / files[first_key])
 
 
 def _load_raw_layout(task: str, data_dir: Path, split: Optional[str]):
@@ -225,10 +236,18 @@ def _load_raw_layout(task: str, data_dir: Path, split: Optional[str]):
     if "train" in files and "test" in files:
         return _load_jsonl(data_dir / files["train"]), _load_jsonl(data_dir / files["test"])
 
-    test_path = data_dir / files["test"]
-    if test_path.suffix == ".json":
-        return pd.read_json(test_path)
-    return _load_jsonl(test_path)
+    if "test" in files:
+        target_key = "test"
+    elif "train" in files:
+        # e.g. T3: {train, gold} - no "test" split exists at all.
+        target_key = "train"
+    else:
+        target_key = next(iter(files))
+
+    target_path = data_dir / files[target_key]
+    if target_path.suffix == ".json":
+        return pd.read_json(target_path)
+    return _load_jsonl(target_path)
 
 
 def load_markets(repo: str = HF_REPO, local_path: Optional[str] = None) -> pd.DataFrame:

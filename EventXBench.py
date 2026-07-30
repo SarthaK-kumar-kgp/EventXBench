@@ -34,7 +34,7 @@ _URLS = {
     "t1_train": "data/t1/train.jsonl",
     "t1_test": "data/t1/test.jsonl",
     "t2_test": "data/t2/test.jsonl",
-    "t3_test": "data/t3/test.jsonl",
+    "t3_train": "data/t3/train.jsonl",
     "t3_gold": "data/t3/gold.jsonl",
     "t4_train": "data/t4/train.jsonl",
     "t4_test": "data/t4/test.jsonl",
@@ -75,10 +75,10 @@ class EventXBench(datasets.GeneratorBasedBuilder):
             name="t3",
             version=VERSION,
             description=(
-                "T3: Evidence Grading (ordinal 0-5). 'test' split = full "
+                "T3: Evidence Grading (ordinal 0-5). 'train' split = full "
                 "silver-labeled export (final_grade); 'gold' split = the "
                 "separate, rare-grade-enriched, human-adjudicated audit pool "
-                "(gold_grade) - not a natural-distribution test split."
+                "(gold_grade) - the actual held-out ground truth."
             ),
         ),
         EventXBenchConfig(

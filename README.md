@@ -55,7 +55,7 @@ Assign an ordinal evidence grade (0--5) to each post-market pair.
 
 - **Grade scale**: 0 (`noise`), 1 (`commentary`), 2 (`speculation`), 3 (`indirect_report`), 4 (`strong_direct`), 5 (`resolving`) - names match the frozen rubric (`t3_annotation_rubric.md`) used by both LLM and human graders
 - **Metrics**: Quadratic-weighted and unweighted kappa, macro-F1
-- **Ground truth**: silver `final_grade` (279,924 rows, deterministic-checks-then-LLM) vs. a separate 2,687-row human-adjudicated `gold_grade` audit pool. Silver only agrees with gold at kappa_w=0.582, below the project's 0.6 reliability bar - see `T3_Reproducible_Package/metrics.md` Phase 6
+- **Ground truth**: silver `final_grade` (`train` split, 279,924 rows, deterministic-checks-then-LLM) vs. a separate 2,687-row human-adjudicated `gold_grade` audit pool (`gold` split). Silver only agrees with gold at kappa_w=0.582, below the project's 0.6 reliability bar - see `T3_Reproducible_Package/metrics.md` Phase 6
 
 ### T4: Market Movement Prediction
 Predict direction and magnitude of the YES-price change at 2-hour horizon after a tweet.
@@ -112,8 +112,8 @@ See [`data/README.md`](data/README.md) for the full dataset card.
 | `market_ohlcv.json` | Price/volume time series (OHLCV) | 1.8 GB |
 | `t1_labels.jsonl` | T1 ground truth with train/test splits | 326 |
 | `t2_groundtruth.jsonl` | T2 post-market linking pairs | 815 |
-| `t3_graded.json` | T3 evidence grades (0--5), silver labels | 279,924 |
-| `t3_gold.json` | T3 human-adjudicated gold audit pool (not part of the count above) | 2,687 |
+| `t3_graded.json` | T3 evidence grades (0--5), silver labels (`train` split) | 279,924 |
+| `t3_gold.json` | T3 human-adjudicated gold audit pool (`gold` split, not part of the count above) | 2,687 |
 | `t4_labels.jsonl` | T4 direction x magnitude labels | 4,803 |
 | `t5_labels.jsonl` | T5 price impact + volume multiplier | 407 |
 | `t6_labels.jsonl` | T6 cross-market propagation labels | 4,006 |
