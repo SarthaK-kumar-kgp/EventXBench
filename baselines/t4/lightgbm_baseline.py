@@ -1,196 +1,242 @@
 #!/usr/bin/env python3
-"""T4 LightGBM Baseline -- Reproduction of classification + regression reports.
+"""T4 LightGBM Baseline -- Market Movement Prediction.
 
-This script reproduces two workflows:
-1) Classification for direction / magnitude tiers.
-2) Regression for delta_30m / delta_2h / delta_6h with Spearman rho report.
+Trains LightGBM classifiers for direction and magnitude using prediction-time
+features available in the public market-day bundle. Hyperparameters are tuned
+on the frozen training split only; the frozen test split is used once.
 
-Primary feature source is `t4_db_features.jsonl` (HF raw file or local path).
-If split is not present in the feature file, split is inferred by joining against
-the official T4 train/test split from `eventxbench.load_task("t4")`.
+Evaluation tiers:
+  - Tier 1: All data
+  - Tier 2: Non-confounded only
+  - Tier 3: Active signals (non-confounded + non-flat)
+
+Usage:
+    python baselines/t4/lightgbm_baseline.py
+    python baselines/t4/lightgbm_baseline.py --local-dir ./data --trials 20
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import warnings
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DIRECTION_LABELS = ["flat", "up", "down"]
+MAGNITUDE_LABELS = ["small", "medium", "large"]
+DELTA_COLS = ["delta_1d", "delta_3d", "delta_7d"]
+HORIZON_NAMES = ["1d", "3d", "7d"]
+
+# All features are observable at the end of bundle day d. Forward prices,
+# deltas, labels, confound flags, and fitted label cut points are excluded.
 FEATURE_COLS = [
-    "like_count",
-    "reply_count",
-    "view_count",
-    "follower_count",
-    "price_t0",
-    "volume_24h_baseline",
-    "category_sports",
-    "category_crypto / digital assets",
-    "category_elections / politics",
-    "category_entertainment / awards",
-    "category_company / product announcements",
-    "finbert_pos_prob",
-    "finbert_question_pos_prob",
+    "price_d",
+    "sigma_14d",
+    "sigma_n_obs",
+    "n_posts",
+    "followers_max",
+    "engagement_sum",
+    "engagement_max",
+    "max_final_grade",
 ]
 
-DELTA_COLS = ["delta_30m", "delta_2h", "delta_6h"]
-HORIZON_NAMES = ["30m", "2h", "6h"]
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="T4 LightGBM baseline (classification + regression)")
-    parser.add_argument("--local-dir", default=None, help="Local data directory for eventxbench.load_task")
-    parser.add_argument("--feature-file", default=None, help="Path to t4_db_features.jsonl")
-    parser.add_argument("--trials", type=int, default=10)
+    parser = argparse.ArgumentParser(description="T4 LightGBM baseline")
+    parser.add_argument("--local-dir", default=None, help="Local data directory")
+    parser.add_argument("--trials", type=int, default=10, help="Optuna trials")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--split-mode",
-        choices=["official", "random"],
-        default="official",
-        help="official: prefer train/test split; random: force random split like original scripts",
-    )
-    parser.add_argument("--test-size", type=float, default=0.2, help="Used only when split is unavailable")
-    parser.add_argument("--output-cls", default="t4_lightgbm_classification.jsonl")
-    parser.add_argument("--output-reg", default="t4_lightgbm_regression.jsonl")
+    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--output", default="t4_lightgbm_predictions.jsonl",
+                        help="Per-instance predictions JSONL for evaluate.py")
+    parser.add_argument("--metrics-output", default=None,
+                        help="Optional JSON summary of tier metrics")
     return parser.parse_args()
 
 
-def _norm_id(v: object) -> str:
-    return "" if v is None else str(v).strip()
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 
-def _build_key_df(df: pd.DataFrame) -> pd.Series:
-    has_condition = "condition_id" in df.columns
-    has_market = "market_id" in df.columns
-    if has_condition:
-        return df["tweet_id"].map(_norm_id) + "__" + df["condition_id"].map(_norm_id)
-    if has_market:
-        return df["tweet_id"].map(_norm_id) + "__" + df["market_id"].map(_norm_id)
-    return df["tweet_id"].map(_norm_id)
+def load_data(local_dir: Optional[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    import eventxbench
 
-
-def load_feature_table(feature_file: Optional[str]) -> pd.DataFrame:
-    if feature_file:
-        path = Path(feature_file)
-        if not path.exists():
-            raise SystemExit(f"Feature file not found: {path}")
-        df = pd.read_json(path, lines=True)
-        print(f"Loaded features from local file: {path}")
-        return df
-
-    # Try workspace-local raw file first.
-    workspace_raw = Path(__file__).resolve().parents[2] / "raw" / "t4_db_features.jsonl"
-    if workspace_raw.exists():
-        df = pd.read_json(workspace_raw, lines=True)
-        print(f"Loaded features from workspace raw file: {workspace_raw}")
-        return df
-
-    # Fall back to HF gated dataset.
-    try:
-        from huggingface_hub import hf_hub_download
-
-        downloaded = hf_hub_download(
-            repo_id="mlsys-io/EventXBench",
-            filename="raw/t4_db_features.jsonl",
-            repo_type="dataset",
+    if local_dir:
+        result = eventxbench.load_task("t4", local_dir=local_dir)
+    else:
+        result = eventxbench.load_task("t4")
+    if not isinstance(result, tuple):
+        raise ValueError(
+            "T4 LightGBM requires frozen train/test files; received an unsplit dataset"
         )
-        df = pd.read_json(downloaded, lines=True)
-        print(f"Loaded features from HF: {downloaded}")
-        return df
-    except Exception as exc:
-        raise SystemExit(
-            "Unable to load t4_db_features.jsonl. Provide --feature-file, place it at raw/t4_db_features.jsonl, "
-            "or login to HF if the dataset is gated."
-        ) from exc
+    train_df, test_df = result
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
-def attach_split_from_t4(df_feat: pd.DataFrame, local_dir: Optional[str]) -> pd.DataFrame:
-    if "split" in df_feat.columns:
-        split_vals = df_feat["split"].astype(str).str.lower().unique().tolist()
-        if any(v in {"train", "test"} for v in split_vals):
-            df = df_feat.copy()
-            df["split"] = df["split"].astype(str).str.lower()
-            return df
+# ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
 
-    import eventxbench
 
-    loaded = eventxbench.load_task("t4", local_dir=local_dir)
-    if not isinstance(loaded, tuple):
-        # fallback: random split later
-        return df_feat.copy()
+def _group_values(df: pd.DataFrame) -> np.ndarray:
+    """Use event clusters when present, with a row-wise market fallback."""
+    groups = []
+    for _, row in df.iterrows():
+        event_id = row.get("event_cluster_id")
+        condition_id = row.get("condition_id")
+        if pd.notna(event_id) and str(event_id).strip():
+            groups.append(f"event:{event_id}")
+        elif pd.notna(condition_id) and str(condition_id).strip():
+            groups.append(f"condition:{condition_id}")
+        else:
+            raise ValueError(
+                "Group-safe CV requires event_cluster_id or condition_id "
+                "for every row"
+            )
+    return np.asarray(groups)
 
-    train_df, test_df = loaded
 
-    # If the feature table has no market-level ID, align by tweet_id only.
-    feat_has_market_level = ("condition_id" in df_feat.columns) or ("market_id" in df_feat.columns)
-    task_has_market_level = "condition_id" in train_df.columns
+def _make_stratified_group_cv(
+    y: np.ndarray,
+    groups: np.ndarray,
+    seed: int,
+    max_splits: int = 5,
+) -> StratifiedGroupKFold:
+    """Build the largest feasible stratified, group-disjoint CV splitter."""
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    classes = np.unique(y)
+    if len(y) != len(groups):
+        raise ValueError("CV labels and groups must have the same length")
+    if len(classes) < 2:
+        raise ValueError("Group-safe stratified CV requires at least two classes")
 
-    if feat_has_market_level and task_has_market_level:
-        train_keys = set((_build_key_df(train_df)).tolist())
-        test_keys = set((_build_key_df(test_df)).tolist())
+    n_groups = len(np.unique(groups))
+    groups_per_class = min(
+        len(np.unique(groups[y == label])) for label in classes
+    )
+    upper = min(max_splits, n_groups, groups_per_class)
+    for n_splits in range(upper, 1, -1):
+        cv = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        try:
+            splits = list(cv.split(np.zeros(len(y)), y, groups))
+        except ValueError:
+            continue
+        if all(
+            len(np.unique(y[train_idx])) == len(classes)
+            and len(np.unique(y[val_idx])) == len(classes)
+            for train_idx, val_idx in splits
+        ):
+            return cv
+    raise ValueError(
+        "Need at least two group-disjoint folds with every class in training"
+    )
+
+
+def _make_group_cv(groups: np.ndarray, max_splits: int = 5) -> GroupKFold:
+    """Build the largest feasible group-disjoint splitter for regression."""
+    n_splits = min(max_splits, len(np.unique(groups)))
+    if n_splits < 2:
+        raise ValueError("Group-safe CV requires at least two distinct groups")
+    return GroupKFold(n_splits=n_splits)
+
+
+def train_lgbm_optuna(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    groups: np.ndarray,
+    n_classes: int,
+    n_trials: int,
+    seed: int,
+) -> "lgb.Booster":
+    """Train LightGBM with Optuna hyperparameter search, return best model."""
+    import lightgbm as lgb
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    cv = _make_stratified_group_cv(y_train, groups, seed)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "verbosity": -1,
+            "boosting_type": "gbdt",
+            "random_state": seed,
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 8, 128),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        }
+        if n_classes == 2:
+            params.update({"objective": "binary", "metric": "binary_logloss"})
+        else:
+            params.update({"objective": "multiclass", "num_class": n_classes, "metric": "multi_logloss"})
+
+        scores = []
+        for tr_idx, val_idx in cv.split(X_train, y_train, groups):
+            dtrain = lgb.Dataset(X_train.iloc[tr_idx], label=y_train[tr_idx])
+            dval = lgb.Dataset(X_train.iloc[val_idx], label=y_train[val_idx], reference=dtrain)
+            model = lgb.train(
+                params, dtrain, valid_sets=[dval], num_boost_round=500,
+                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
+            )
+            preds = model.predict(X_train.iloc[val_idx])
+            if n_classes == 2:
+                pred_labels = (np.array(preds) >= 0.5).astype(int)
+            else:
+                pred_labels = np.argmax(preds, axis=1)
+            scores.append(f1_score(y_train[val_idx], pred_labels, average="macro", zero_division=0))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials)
+
+    best = study.best_params.copy()
+    best.update({"verbosity": -1, "random_state": seed})
+    if n_classes == 2:
+        best.update({"objective": "binary", "metric": "binary_logloss"})
     else:
-        train_keys = set(train_df["tweet_id"].map(_norm_id).tolist())
-        test_keys = set(test_df["tweet_id"].map(_norm_id).tolist())
+        best.update({"objective": "multiclass", "num_class": n_classes, "metric": "multi_logloss"})
 
-    out = df_feat.copy()
-    if feat_has_market_level and task_has_market_level:
-        keys = _build_key_df(out)
-    else:
-        keys = out["tweet_id"].map(_norm_id)
-    out["split"] = ""
-    out.loc[keys.isin(train_keys), "split"] = "train"
-    out.loc[keys.isin(test_keys), "split"] = "test"
-    return out
+    dtrain_full = lgb.Dataset(X_train, label=y_train)
+    return lgb.train(best, dtrain_full, num_boost_round=300)
 
 
-def attach_deltas_from_t4(df_feat: pd.DataFrame, local_dir: Optional[str]) -> pd.DataFrame:
-    """Attach delta_30m/delta_2h/delta_6h from official T4 labels when missing."""
-    if all(col in df_feat.columns for col in DELTA_COLS):
-        return df_feat
-
-    import eventxbench
-
-    loaded = eventxbench.load_task("t4", local_dir=local_dir)
-    if isinstance(loaded, tuple):
-        t4_full = pd.concat(loaded, ignore_index=True)
-    else:
-        t4_full = loaded
-
-    needed = ["tweet_id", "condition_id"] + DELTA_COLS
-    existing_needed = [c for c in needed if c in t4_full.columns]
-    if not all(c in existing_needed for c in ["tweet_id"] + DELTA_COLS):
-        return df_feat
-
-    t4_small = t4_full[existing_needed].copy()
-
-    out = df_feat.copy()
-    if "condition_id" in out.columns and "condition_id" in t4_small.columns:
-        out = out.merge(t4_small, on=["tweet_id", "condition_id"], how="left", suffixes=("", "_from_t4"))
-    else:
-        # Fallback to tweet-only join for feature tables without condition_id.
-        t4_small = t4_small.drop_duplicates(subset=["tweet_id"])
-        out = out.merge(t4_small, on=["tweet_id"], how="left", suffixes=("", "_from_t4"))
-
-    # Consolidate potential suffix columns.
-    for c in DELTA_COLS:
-        if c not in out.columns and f"{c}_from_t4" in out.columns:
-            out[c] = out[f"{c}_from_t4"]
-        elif c in out.columns and f"{c}_from_t4" in out.columns:
-            out[c] = out[c].fillna(out[f"{c}_from_t4"])
-    drop_cols = [f"{c}_from_t4" for c in DELTA_COLS if f"{c}_from_t4" in out.columns]
-    if drop_cols:
-        out = out.drop(columns=drop_cols)
-
-    return out
+def predict_labels(model, X: pd.DataFrame, n_classes: int) -> np.ndarray:
+    preds = model.predict(X)
+    if n_classes == 2:
+        return (np.array(preds) >= 0.5).astype(int)
+    return np.argmax(preds, axis=1)
 
 
-def rankdata(values: list[float]) -> list[float]:
+# ---------------------------------------------------------------------------
+# Spearman rho (pure-Python, ties-aware)
+# ---------------------------------------------------------------------------
+
+
+def _rankdata(values: list[float]) -> list[float]:
     indexed = sorted(enumerate(values), key=lambda x: x[1])
     ranks = [0.0] * len(values)
     i = 0
@@ -198,531 +244,410 @@ def rankdata(values: list[float]) -> list[float]:
         j = i
         while j + 1 < len(indexed) and indexed[j + 1][1] == indexed[i][1]:
             j += 1
-        avg_rank = (i + j + 2) / 2.0
+        avg = (i + j + 2) / 2.0
         for k in range(i, j + 1):
-            ranks[indexed[k][0]] = avg_rank
+            ranks[indexed[k][0]] = avg
         i = j + 1
     return ranks
 
 
-def pearson_corr(x: list[float], y: list[float]) -> Optional[float]:
+def spearman_rho(x: list[float], y: list[float]) -> Optional[float]:
     n = len(x)
     if n < 2:
         return None
-    mx = sum(x) / n
-    my = sum(y) / n
-    cov = sum((a - mx) * (b - my) for a, b in zip(x, y))
-    var_x = sum((a - mx) ** 2 for a in x)
-    var_y = sum((b - my) ** 2 for b in y)
-    if var_x == 0 or var_y == 0:
+    rx, ry = _rankdata(x), _rankdata(y)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx)
+    vy = sum((b - my) ** 2 for b in ry)
+    if vx == 0 or vy == 0:
         return None
-    return cov / math.sqrt(var_x * var_y)
+    return cov / ((vx * vy) ** 0.5)
 
 
-def spearman_rho(x: list[float], y: list[float]) -> Optional[float]:
-    if len(x) < 2 or len(y) < 2:
-        return None
-    try:
-        from scipy.stats import spearmanr
-
-        raw: Any = spearmanr(x, y)
-        if isinstance(raw, tuple):
-            rho_val = raw[0]
-        else:
-            rho_val = getattr(raw, "statistic", None)
-        if rho_val is None:
-            return None
-        rho = float(rho_val)
-        if rho is None or math.isnan(rho):
-            return None
-        return float(rho)
-    except Exception:
-        return pearson_corr(rankdata(x), rankdata(y))
+# ---------------------------------------------------------------------------
+# Regression (continuous delta prediction -> Spearman rho)
+# ---------------------------------------------------------------------------
 
 
-def get_active_mask(df: pd.DataFrame, target_col: str) -> pd.Series:
-    if target_col == "direction_label":
-        return (df["confound_flag"] == False) & (df["direction_label"] != "flat")
-    if target_col == "magnitude_bucket":
-        return (df["confound_flag"] == False) & (df["direction_label"] != "flat")
-    return df["confound_flag"] == False
-
-
-def get_label_mapping(target_col: str, tier_name: str) -> dict[str, int]:
-    if target_col == "direction_label":
-        if tier_name == "Tier3 Active (Non-confounded + Non-flat)":
-            return {"down": 0, "up": 1}
-        return {"flat": 0, "up": 1, "down": 2}
-    if target_col == "magnitude_bucket":
-        if tier_name == "Tier3 Active (Non-confounded + Non-small)":
-            return {"medium": 0, "large": 1}
-        return {"small": 0, "medium": 1, "large": 2}
-    raise ValueError(f"Unsupported target: {target_col}")
-
-
-def predict_labels(model, x_test: pd.DataFrame, n_classes: int) -> np.ndarray:
-    preds_prob = model.predict(x_test)
-    if n_classes == 2:
-        return (preds_prob >= 0.5).astype(int)
-    return np.argmax(preds_prob, axis=1)
-
-
-def split_train_test(
-    df_tier: pd.DataFrame,
-    y: pd.Series,
-    seed: int,
-    test_size: float,
-    split_mode: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    if split_mode == "official" and "split" in df_tier.columns:
-        split_col = df_tier["split"].astype(str).str.lower()
-        tr_mask = split_col == "train"
-        te_mask = split_col == "test"
-        if tr_mask.any() and te_mask.any():
-            return (
-                df_tier.loc[tr_mask],
-                df_tier.loc[te_mask],
-                y.loc[tr_mask],
-                y.loc[te_mask],
-            )
-
-    x_train, x_test, y_train, y_test = train_test_split(
-        df_tier,
-        y,
-        test_size=test_size,
-        random_state=seed,
-        stratify=y,
-    )
-    return x_train, x_test, y_train, y_test
-
-
-def run_one_tier_classification(
-    df_tier: pd.DataFrame,
-    tier_name: str,
-    target_col: str,
-    features: list[str],
+def train_lgbm_regressor_optuna(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    groups: np.ndarray,
     n_trials: int,
     seed: int,
-    test_size: float,
-    split_mode: str,
-) -> Optional[dict]:
+) -> "lgb.Booster":
+    """Train a LightGBM regressor with Optuna (MAE objective)."""
     import lightgbm as lgb
     import optuna
 
-    print("\n" + "=" * 70)
-    print(f"{tier_name} | TARGET: {target_col}")
-    print("=" * 70)
-
-    label_mapping = get_label_mapping(target_col, tier_name)
-    class_count = len(label_mapping)
-
-    y = df_tier[target_col].map(label_mapping)
-    valid_mask = y.notnull()
-    df_tier = df_tier[valid_mask].copy()
-    y = y[valid_mask].astype(int)
-
-    if len(df_tier) < 10:
-        print(f"Insufficient samples: {len(df_tier)}")
-        return None
-
-    X = df_tier[features].copy().astype(float)
-    print(f"Samples: {len(df_tier)} | Classes: {class_count}")
-    print("Class distribution:")
-    print(df_tier[target_col].value_counts())
-
-    x_train_df, x_test_df, y_train, y_test = split_train_test(df_tier, y, seed, test_size, split_mode)
-    X_train = x_train_df[features].astype(float)
-    X_test = x_test_df[features].astype(float)
-    print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    cv = _make_group_cv(groups)
 
     def objective(trial: optuna.Trial) -> float:
         params = {
             "verbosity": -1,
             "boosting_type": "gbdt",
+            "objective": "regression",
+            "metric": "mae",
+            "random_state": seed,
             "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.1, log=True),
             "num_leaves": trial.suggest_int("num_leaves", 16, 128),
             "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-            "random_state": seed,
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
         }
-        if class_count == 2:
-            params.update({"objective": "binary", "metric": "binary_logloss"})
-        else:
-            params.update({"objective": "multiclass", "num_class": class_count, "metric": "multi_logloss"})
+        scores = []
+        for tr_idx, val_idx in cv.split(X_train, y_train, groups):
+            dtrain = lgb.Dataset(
+                X_train.iloc[tr_idx], label=y_train[tr_idx]
+            )
+            dval = lgb.Dataset(
+                X_train.iloc[val_idx], label=y_train[val_idx],
+                reference=dtrain,
+            )
+            gbm = lgb.train(
+                params, dtrain, valid_sets=[dval], num_boost_round=500,
+                callbacks=[
+                    lgb.early_stopping(30, verbose=False),
+                    lgb.log_evaluation(-1),
+                ],
+            )
+            pred = gbm.predict(X_train.iloc[val_idx])
+            scores.append(
+                float(np.mean(np.abs(y_train[val_idx] - pred)))
+            )
+        return -float(np.mean(scores))
 
-        x_tr, x_val, y_tr, y_val = train_test_split(
-            X_train,
-            y_train,
-            test_size=0.2,
-            random_state=seed,
-            stratify=y_train,
-        )
-        dtrain = lgb.Dataset(x_tr, label=y_tr)
-        dval = lgb.Dataset(x_val, label=y_val, reference=dtrain)
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials)
 
-        gbm = lgb.train(
-            params,
-            dtrain,
-            valid_sets=[dval],
-            num_boost_round=500,
-            callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
-        )
-        pred_labels = predict_labels(gbm, x_val, class_count)
-        return float(accuracy_score(y_val, pred_labels))
-
-    print(f"Starting Bayesian Optimization (n_trials={n_trials})...")
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-    print("Best Hyperparameters:")
-    print(study.best_params)
-
-    best_params = study.best_params.copy()
-    best_params.update({"verbosity": -1, "random_state": seed})
-    if class_count == 2:
-        best_params.update({"objective": "binary", "metric": "binary_logloss"})
-    else:
-        best_params.update({"objective": "multiclass", "num_class": class_count, "metric": "multi_logloss"})
-
+    best = study.best_params.copy()
+    best.update({
+        "verbosity": -1,
+        "boosting_type": "gbdt",
+        "objective": "regression",
+        "metric": "mae",
+        "random_state": seed,
+    })
     dtrain_full = lgb.Dataset(X_train, label=y_train)
-    final_model = lgb.train(best_params, dtrain_full, num_boost_round=150)
-
-    test_preds = predict_labels(final_model, X_test, class_count)
-    acc = float(accuracy_score(y_test, test_preds))
-    macro_f1 = float(f1_score(y_test, test_preds, average="macro", zero_division=0))
-
-    print("\nFinal Test Results")
-    print(f"Accuracy: {acc * 100:.2f}%")
-    print(f"Macro-F1: {macro_f1 * 100:.2f}%")
-
-    feat_imp = pd.DataFrame(
-        {
-            "Feature": features,
-            "Importance": final_model.feature_importance(importance_type="gain"),
-        }
-    ).sort_values(by="Importance", ascending=False)
-    print("Top 5 Feature Importances (Gain):")
-    print(feat_imp.head(5))
-
-    return {
-        "tier": tier_name,
-        "target": target_col,
-        "samples": int(len(df_tier)),
-        "classes": int(class_count),
-        "accuracy": acc,
-        "macro_f1": macro_f1,
-    }
+    return lgb.train(best, dtrain_full, num_boost_round=150)
 
 
-def run_regression_tier(
-    df_tier: pd.DataFrame,
+# ---------------------------------------------------------------------------
+# Tier evaluation
+# ---------------------------------------------------------------------------
+
+
+def evaluate_tier(
     tier_name: str,
+    train_tier: pd.DataFrame,
+    test_tier: pd.DataFrame,
     features: list[str],
-    delta_cols: list[str],
-    horizon_names: list[str],
+    target_col: str,
+    label_list: list[str],
     n_trials: int,
     seed: int,
     test_size: float,
-    split_mode: str,
-) -> Optional[dict]:
-    import lightgbm as lgb
-    import optuna
+) -> tuple[dict, pd.DataFrame]:
+    """Tune on frozen train data and evaluate on the frozen test split."""
 
-    print("\n" + "=" * 84)
-    print(f"{tier_name} | REGRESSION: Predicting Delta Values")
-    print("=" * 84)
+    label_map = {lab: i for i, lab in enumerate(label_list)}
+    y_train = train_tier[target_col].map(label_map)
+    y_test = test_tier[target_col].map(label_map)
+    train_valid = y_train.notnull()
+    test_valid = y_test.notnull()
+    train_clean = train_tier[train_valid].copy()
+    test_clean = test_tier[test_valid].copy()
+    y_train = y_train[train_valid].values.astype(int)
+    y_test = y_test[test_valid].values.astype(int)
+    X_train = train_clean[features].copy().astype(float)
+    X_test = test_clean[features].copy().astype(float)
 
-    required_cols = features + delta_cols
-    missing_cols = [col for col in required_cols if col not in df_tier.columns]
-    if missing_cols:
-        print(f"Warning: Missing columns {missing_cols}, skipping tier")
-        return None
+    if len(X_train) < 10 or len(X_test) < 1:
+        metrics = {
+            "tier": tier_name,
+            "target": target_col,
+            "n_train": len(X_train),
+            "n_test": len(X_test),
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "note": "too few samples",
+        }
+        return metrics, pd.DataFrame()
 
-    valid_mask = df_tier[delta_cols].notnull().all(axis=1)
-    df_tier_clean = df_tier[valid_mask].copy()
+    n_classes = len(label_list)
+    train_groups = _group_values(train_clean)
+    model = train_lgbm_optuna(
+        X_train, y_train, train_groups, n_classes, n_trials, seed
+    )
+    pred = predict_labels(model, X_test, n_classes)
 
-    if len(df_tier_clean) < 10:
-        print(f"Insufficient samples: {len(df_tier_clean)}")
-        return None
+    acc = accuracy_score(y_test, pred)
+    mf1 = f1_score(y_test, pred, average="macro", zero_division=0)
 
-    X = df_tier_clean[features].astype(float)
-    print(f"Samples: {len(df_tier_clean)}")
-
-    if split_mode == "official" and "split" in df_tier_clean.columns:
-        split_col = df_tier_clean["split"].astype(str).str.lower()
-        tr_mask = split_col == "train"
-        te_mask = split_col == "test"
-        if tr_mask.any() and te_mask.any():
-            X_train = X.loc[tr_mask]
-            X_test = X.loc[te_mask]
-            idx_train = X_train.index
-            idx_test = X_test.index
-        else:
-            X_train, X_test = train_test_split(X, test_size=test_size, random_state=seed)
-            idx_train = X_train.index
-            idx_test = X_test.index
-    else:
-        X_train, X_test = train_test_split(X, test_size=test_size, random_state=seed)
-        idx_train = X_train.index
-        idx_test = X_test.index
-
-    all_results = {
+    metrics = {
         "tier": tier_name,
-        "samples": int(len(df_tier_clean)),
-        "spearman_by_horizon": {},
-        "spearman_flat": None,
-        "mae_by_horizon": {},
+        "target": target_col,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "accuracy": acc,
+        "macro_f1": mf1,
     }
+    id_cols = [
+        c for c in ("instance_id", "condition_id", "bundle_day")
+        if c in test_clean.columns
+    ]
+    pred_rows = test_clean[id_cols].copy()
+    pred_rows[target_col] = [label_list[i] for i in pred]
+    return metrics, pred_rows
 
+
+def evaluate_regression_tier(
+    tier_name: str,
+    train_tier: pd.DataFrame,
+    test_tier: pd.DataFrame,
+    features: list[str],
+    n_trials: int,
+    seed: int,
+    test_size: float,
+) -> tuple[dict, pd.DataFrame]:
+    """Train on the frozen train split and score each daily test horizon."""
     all_pred: list[float] = []
     all_actual: list[float] = []
+    per_horizon: dict[str, Optional[float]] = {}
+    n_train_by_horizon: dict[str, int] = {}
+    n_test_by_horizon: dict[str, int] = {}
+    notes_by_horizon: dict[str, str] = {}
+    id_cols = [
+        c for c in ("instance_id", "condition_id", "bundle_day")
+        if c in test_tier.columns
+    ]
+    pred_rows = test_tier[id_cols].copy().reset_index(drop=True)
+    for delta_col in DELTA_COLS:
+        pred_rows[delta_col] = np.nan
 
-    for delta_col, horizon_name in zip(delta_cols, horizon_names):
-        print(f"\nTraining regression for {horizon_name} (target: {delta_col})...")
+    for delta_col, horizon in zip(DELTA_COLS, HORIZON_NAMES):
+        train_valid = train_tier[delta_col].notnull()
+        test_valid = test_tier[delta_col].notnull()
+        train_clean = train_tier[train_valid].copy()
+        n_train_by_horizon[horizon] = int(train_valid.sum())
+        n_test_by_horizon[horizon] = int(test_valid.sum())
 
-        y_train = df_tier_clean.loc[idx_train, delta_col].astype(float)
-        y_test = df_tier_clean.loc[idx_test, delta_col].astype(float)
-
-        def objective(trial: optuna.Trial) -> float:
-            params = {
-                "verbosity": -1,
-                "boosting_type": "gbdt",
-                "objective": "regression",
-                "metric": "mae",
-                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.1, log=True),
-                "num_leaves": trial.suggest_int("num_leaves", 16, 128),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-                "random_state": seed,
-            }
-
-            x_tr, x_val, y_tr, y_val = train_test_split(
-                X_train,
-                y_train,
-                test_size=0.2,
-                random_state=seed,
+        if train_clean.empty or test_tier.empty:
+            per_horizon[horizon] = None
+            notes_by_horizon[horizon] = (
+                "no train rows for target or no test rows"
             )
-            dtrain = lgb.Dataset(x_tr, label=y_tr)
-            dval = lgb.Dataset(x_val, label=y_val, reference=dtrain)
+            continue
 
-            gbm = lgb.train(
-                params,
-                dtrain,
-                valid_sets=[dval],
-                num_boost_round=500,
-                callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
-            )
+        X_train = train_clean[features].copy().astype(float)
+        X_test = test_tier[features].copy().astype(float)
+        train_groups = _group_values(train_clean)
+        y_train = train_clean[delta_col].values.astype(float)
 
-            pred_val = np.asarray(gbm.predict(x_val), dtype=float)
-            mae = mean_absolute_error(y_val, pred_val)
-            return float(-mae)
-
-        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-        print(f"Best MAE: {-study.best_value:.4f}")
-        print(f"Best Hyperparameters: {study.best_params}")
-
-        best_params = study.best_params.copy()
-        best_params.update(
-            {
-                "verbosity": -1,
-                "boosting_type": "gbdt",
-                "objective": "regression",
-                "metric": "mae",
-                "random_state": seed,
-            }
+        model = train_lgbm_regressor_optuna(
+            X_train, y_train, train_groups, n_trials, seed
         )
+        y_pred = np.asarray(model.predict(X_test), dtype=float)
+        pred_rows[delta_col] = y_pred
 
-        dtrain_full = lgb.Dataset(X_train, label=y_train)
-        final_model = lgb.train(best_params, dtrain_full, num_boost_round=150)
-
-        y_pred = np.asarray(final_model.predict(X_test), dtype=float)
-
-        rho = spearman_rho(y_pred.tolist(), y_test.tolist())
-        mae_test = float(mean_absolute_error(y_test, y_pred))
-        rmse_test = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-
-        print(f"Test MAE: {mae_test:.4f}")
-        print(f"Test RMSE: {rmse_test:.4f}")
-        if rho is not None:
-            print(f"Spearman rho @ {horizon_name}: {rho:.4f}")
+        if test_valid.any():
+            valid_mask = test_valid.to_numpy()
+            y_test = test_tier.loc[test_valid, delta_col].values.astype(float)
+            valid_pred = y_pred[valid_mask]
+            per_horizon[horizon] = spearman_rho(
+                valid_pred.tolist(), y_test.tolist()
+            )
+            all_pred.extend(valid_pred.tolist())
+            all_actual.extend(y_test.tolist())
         else:
-            print(f"Spearman rho @ {horizon_name}: N/A")
+            per_horizon[horizon] = None
 
-        all_results["spearman_by_horizon"][horizon_name] = rho
-        all_results["mae_by_horizon"][horizon_name] = mae_test
+    flat_rho = spearman_rho(all_pred, all_actual)
+    metrics = {
+        "tier": tier_name,
+        "target": "delta_curve",
+        "n_train": len(train_tier),
+        "n_test": len(test_tier),
+        "n_train_by_horizon": n_train_by_horizon,
+        "n_test_by_horizon": n_test_by_horizon,
+        "spearman_by_horizon": per_horizon,
+        "spearman_flat": flat_rho,
+    }
+    if notes_by_horizon:
+        metrics["notes_by_horizon"] = notes_by_horizon
+    if all(pred_rows[col].isna().all() for col in DELTA_COLS):
+        metrics["note"] = "no horizon had enough training data"
+    return metrics, pred_rows
 
-        all_pred.extend(y_pred.tolist())
-        all_actual.extend(y_test.tolist())
 
-        feat_imp = pd.DataFrame(
-            {"Feature": features, "Importance": final_model.feature_importance(importance_type="gain")}
-        ).sort_values(by="Importance", ascending=False)
-        print(f"Top 3 Features for {horizon_name}:")
-        print(feat_imp.head(3).to_string(index=False))
-
-    rho_flat = spearman_rho(all_pred, all_actual)
-    if rho_flat is not None:
-        print(f"\nSpearman rho @ ALL horizons (flatten): {rho_flat:.4f}")
-    else:
-        print("\nSpearman rho @ ALL horizons (flatten): N/A")
-
-    all_results["spearman_flat"] = rho_flat
-    return all_results
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
     args = parse_args()
 
     try:
-        import lightgbm as lgb  # noqa: F401
+        import lightgbm as lgb
     except ImportError:
-        raise SystemExit("Install lightgbm: pip install lightgbm")
+        raise SystemExit("Install lightgbm:  pip install lightgbm")
     try:
-        import optuna  # noqa: F401
+        import optuna
     except ImportError:
-        raise SystemExit("Install optuna: pip install optuna")
+        raise SystemExit("Install optuna:  pip install optuna")
 
     warnings.filterwarnings("ignore", category=UserWarning)
 
-    print("Loading feature data...")
-    df = load_feature_table(args.feature_file)
-    print(f"Total records in JSONL: {len(df)}")
+    print("Loading T4 data...")
+    train_df, test_df = load_data(args.local_dir)
+    print(f"Loaded train/test: {len(train_df)}/{len(test_df)} rows")
 
-    # Attach train/test split if missing.
-    df = attach_split_from_t4(df, args.local_dir)
-    df = attach_deltas_from_t4(df, args.local_dir)
+    # Detect available features
+    available = [
+        c for c in FEATURE_COLS
+        if c in train_df.columns and c in test_df.columns
+    ]
+    if not available:
+        raise SystemExit(f"No usable features found. Expected: {FEATURE_COLS}")
+    print(f"Features: {available}")
 
-    # Numeric cleanup for features/targets.
-    for col in FEATURE_COLS + DELTA_COLS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Build tiers
+    tiers = [
+        ("Tier 1: All Data", train_df.copy(), test_df.copy()),
+        (
+            "Tier 2: Non-confounded",
+            train_df[~train_df["confound_flag"].astype(bool)].copy(),
+            test_df[~test_df["confound_flag"].astype(bool)].copy(),
+        ),
+        (
+            "Tier 3: Active (non-confounded + non-flat)",
+            train_df[
+                (~train_df["confound_flag"].astype(bool))
+                & (train_df["direction_label"] != "flat")
+            ].copy(),
+            test_df[
+                (~test_df["confound_flag"].astype(bool))
+                & (test_df["direction_label"] != "flat")
+            ].copy(),
+        ),
+    ]
 
-    available_features = [c for c in FEATURE_COLS if c in df.columns]
-    if not available_features:
-        raise SystemExit(f"No feature columns found. Expected any of: {FEATURE_COLS}")
+    results = []
+    tier1_direction: pd.DataFrame | None = None
+    tier1_magnitude: pd.DataFrame | None = None
 
-    missing_feature_cols = [c for c in FEATURE_COLS if c not in df.columns]
-    if missing_feature_cols:
-        print(f"Warning: Missing feature columns, using subset: {missing_feature_cols}")
-
-    print(f"Using feature columns ({len(available_features)}): {available_features}")
-    print(f"Split mode: {args.split_mode}")
-
-    # ---------------------- Classification reproduction ----------------------
-    cls_summary_rows: list[dict] = []
-    for target_col in ["direction_label", "magnitude_bucket"]:
-        if target_col not in df.columns:
-            print(f"Skipping classification target (missing): {target_col}")
-            continue
-
-        if target_col == "direction_label":
-            tier3_name = "Tier3 Active (Non-confounded + Non-flat)"
+    # Direction evaluation
+    print("\n=== DIRECTION ===")
+    for tier_name, tier_train, tier_test in tiers:
+        # For Tier 3, only up/down labels exist
+        if "non-flat" in tier_name:
+            labels = ["up", "down"]
         else:
-            tier3_name = "Tier3 Active (Non-confounded + Non-small)"
-
-        tier_configs = [
-            ("Tier1 All Data", df.copy()),
-            ("Tier2 Non-confounded", df[df["confound_flag"] == False].copy()),
-            (tier3_name, df[get_active_mask(df, target_col)].copy()),
-        ]
-
-        for tier_name, tier_df in tier_configs:
-            result = run_one_tier_classification(
-                tier_df,
-                tier_name,
-                target_col,
-                available_features,
-                args.trials,
-                args.seed,
-                args.test_size,
-                args.split_mode,
-            )
-            if result is not None:
-                cls_summary_rows.append(result)
-
-    cls_summary_df = pd.DataFrame(cls_summary_rows)
-    if not cls_summary_df.empty:
-        cls_summary_df["accuracy_pct"] = cls_summary_df["accuracy"] * 100
-        cls_summary_df["macro_f1_pct"] = cls_summary_df["macro_f1"] * 100
-
-        out_cls = Path(args.output_cls)
-        out_cls.parent.mkdir(parents=True, exist_ok=True)
-        with out_cls.open("w", encoding="utf-8") as f:
-            for rec in cls_summary_rows:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"Classification results saved to {out_cls}")
-
-    # ---------------------- Regression reproduction -------------------------
-    reg_results: list[dict] = []
-    if all(col in df.columns for col in DELTA_COLS):
-        reg_tiers = [
-            ("Tier1 All Data", df.copy()),
-            ("Tier2 Non-confounded", df[df["confound_flag"] == False].copy()),
-            (
-                "Tier3 Active (Non-confounded + Non-flat)",
-                df[(df["confound_flag"] == False) & (df["direction_label"] != "flat")].copy(),
-            ),
-        ]
-
-        for tier_name, tier_df in reg_tiers:
-            result = run_regression_tier(
-                tier_df,
-                tier_name,
-                available_features,
-                DELTA_COLS,
-                HORIZON_NAMES,
-                args.trials,
-                args.seed,
-                args.test_size,
-                args.split_mode,
-            )
-            if result is not None:
-                reg_results.append(result)
-
-        out_reg = Path(args.output_reg)
-        out_reg.parent.mkdir(parents=True, exist_ok=True)
-        with out_reg.open("w", encoding="utf-8") as f:
-            for rec in reg_results:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"Regression results saved to {out_reg}")
-    else:
-        print(f"Skipping regression: missing one of {DELTA_COLS}")
-
-    print("\n" + "=" * 90)
-    print("FINAL SUMMARY BLOCK")
-    print("=" * 90)
-
-    if not cls_summary_df.empty:
-        print("\n[Classification Summary: direction + magnitude]")
-        print(
-            cls_summary_df[["target", "tier", "samples", "classes", "accuracy_pct", "macro_f1_pct"]].to_string(
-                index=False
-            )
+            labels = DIRECTION_LABELS
+        r, pred_rows = evaluate_tier(
+            tier_name, tier_train, tier_test, available, "direction_label",
+            labels, args.trials, args.seed, args.test_size,
         )
-    else:
-        print("\n[Classification Summary: direction + magnitude]")
-        print("No classification results.")
+        results.append(r)
+        print(
+            f"  {tier_name}: train={r['n_train']} test={r['n_test']}  "
+            f"Acc={r['accuracy']*100:.2f}%  F1={r['macro_f1']*100:.2f}%"
+        )
+        if tier_name.startswith("Tier 1"):
+            tier1_direction = pred_rows
 
-    if reg_results:
-        print("\n[Regression Spearman Summary]")
-        for result in reg_results:
-            print(f"\n{result['tier']} (n={result['samples']})")
-            print("-" * 84)
-            for horizon in HORIZON_NAMES:
-                rho = result["spearman_by_horizon"].get(horizon)
-                mae = result["mae_by_horizon"].get(horizon)
-                if rho is not None:
-                    print(f"  {horizon}: rho={rho:.4f} | MAE={mae:.4f}")
-                else:
-                    print(f"  {horizon}: rho=N/A | MAE={mae:.4f}")
+    # Magnitude evaluation
+    print("\n=== MAGNITUDE ===")
+    for tier_name, tier_train, tier_test in tiers:
+        labels = MAGNITUDE_LABELS if "non-flat" in tier_name else [
+            "none", *MAGNITUDE_LABELS
+        ]
+        r, pred_rows = evaluate_tier(
+            tier_name, tier_train, tier_test, available, "magnitude_bucket",
+            labels, args.trials, args.seed, args.test_size,
+        )
+        results.append(r)
+        print(
+            f"  {tier_name}: train={r['n_train']} test={r['n_test']}  "
+            f"Acc={r['accuracy']*100:.2f}%  F1={r['macro_f1']*100:.2f}%"
+        )
+        if tier_name.startswith("Tier 1"):
+            tier1_magnitude = pred_rows
 
-            if result["spearman_flat"] is not None:
-                print(f"  ALL horizons (flatten): rho={result['spearman_flat']:.4f}")
-            else:
-                print("  ALL horizons (flatten): rho=N/A")
-    else:
-        print("\n[Regression Spearman Summary]")
-        print("No regression results.")
+    # Continuous delta regression -> Spearman rho on the horizon curve
+    print("\n=== CONTINUOUS DELTA (Spearman rho) ===")
+    tier1_pred_rows: pd.DataFrame | None = None
+    for tier_name, tier_train, tier_test in tiers:
+        metrics, pred_rows = evaluate_regression_tier(
+            tier_name, tier_train, tier_test, available, args.trials,
+            args.seed, args.test_size,
+        )
+        results.append(metrics)
+        if metrics.get("note"):
+            print(f"  {tier_name}: {metrics['note']}")
+            continue
+        parts = []
+        for h in HORIZON_NAMES:
+            rho = metrics["spearman_by_horizon"].get(h)
+            parts.append(f"{h}={'N/A' if rho is None else f'{rho:.4f}'}")
+        flat = metrics["spearman_flat"]
+        parts.append(f"flat={'N/A' if flat is None else f'{flat:.4f}'}")
+        print(
+            f"  {tier_name}: train={metrics['n_train']} "
+            f"test={metrics['n_test']}  " + "  ".join(parts)
+        )
+        if tier_name.startswith("Tier 1"):
+            tier1_pred_rows = pred_rows
+
+    # Save per-instance predictions (Tier 1) for evaluation/evaluate.py
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    id_cols = [
+        c for c in ("instance_id", "condition_id", "bundle_day")
+        if c in test_df.columns
+    ]
+    merged_predictions = test_df[id_cols].copy()
+    prediction_frames = [
+        frame for frame in (tier1_direction, tier1_magnitude, tier1_pred_rows)
+        if frame is not None and len(frame)
+    ]
+    for frame in prediction_frames:
+        merged_predictions = merged_predictions.merge(
+            frame, on=id_cols, how="left"
+        )
+    with output_path.open("w", encoding="utf-8") as f:
+        for _, row in merged_predictions.iterrows():
+            rec = {
+                "instance_id": str(row["instance_id"]),
+                "condition_id": str(row["condition_id"]),
+                "bundle_day": str(row["bundle_day"]),
+                "direction_label": (
+                    None if pd.isna(row.get("direction_label"))
+                    else row.get("direction_label")
+                ),
+                "magnitude_bucket": (
+                    None if pd.isna(row.get("magnitude_bucket"))
+                    else row.get("magnitude_bucket")
+                ),
+            }
+            for delta_col in DELTA_COLS:
+                value = row.get(delta_col)
+                rec[delta_col] = None if pd.isna(value) else float(value)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"\nPredictions saved to {output_path}")
+
+    # Save tier metrics summary
+    if args.metrics_output:
+        mpath = Path(args.metrics_output)
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        with mpath.open("w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+        print(f"Metrics saved to {mpath}")
 
 
 if __name__ == "__main__":
