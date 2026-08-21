@@ -56,6 +56,55 @@ def macro_f1(
 
 
 # ------------------------------------------------------------------ #
+#  Precision at K (positive-class retrieval)                         #
+# ------------------------------------------------------------------ #
+
+
+def precision_at_k(
+    y_true: Sequence[str],
+    scores: Sequence[dict[str, float]],
+    pos_class: str = "high_interest",
+    k: int = 5,
+) -> float:
+    """Precision at K for the positive class.
+
+    Ranks instances by the score of *pos_class* (descending), takes the
+    top-K, and returns the fraction whose true label equals *pos_class*.
+
+    Parameters
+    ----------
+    y_true : sequence of str
+        Ground-truth labels.
+    scores : sequence of dict
+        Per-instance score dicts ``{label: confidence}``.  Must have the
+        same length as *y_true*.
+    pos_class : str
+        The class to treat as positive.
+    k : int
+        Number of top-ranked instances to consider.
+
+    Returns
+    -------
+    float
+        Precision at K in ``[0, 1]``.  Returns 0 when *k* is 0 or when
+        there are fewer than 1 instance(s).
+    """
+    n = len(y_true)
+    if len(scores) != n:
+        raise ValueError("y_true and scores must have the same length")
+    if k <= 0 or n < 1:
+        return 0.0
+    k = min(k, n)
+    ranked = sorted(
+        zip(y_true, scores),
+        key=lambda x: x[1].get(pos_class, 0.0),
+        reverse=True,
+    )
+    topk = ranked[:k]
+    return sum(1 for t, _ in topk if t == pos_class) / k
+
+
+# ------------------------------------------------------------------ #
 #  Accuracy                                                           #
 # ------------------------------------------------------------------ #
 
@@ -166,6 +215,45 @@ def quadratic_weighted_kappa(
     if den == 0.0:
         return 1.0
     return 1.0 - num / den
+
+
+# ------------------------------------------------------------------ #
+#  Unweighted Cohen's Kappa                                           #
+# ------------------------------------------------------------------ #
+
+def cohen_kappa(
+    y_true: Sequence[int],
+    y_pred: Sequence[int],
+    num_classes: int,
+) -> float:
+    """Unweighted Cohen's kappa for classification.
+
+    Parameters
+    ----------
+    y_true, y_pred : sequence of int
+        Integer class indices in ``[0, num_classes)``.
+    num_classes : int
+        Number of classes.
+    """
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+
+    hist_true = [0] * num_classes
+    hist_pred = [0] * num_classes
+    agree = 0
+    for t, p in zip(y_true, y_pred):
+        hist_true[t] += 1
+        hist_pred[p] += 1
+        if t == p:
+            agree += 1
+
+    po = agree / n
+    pe = sum(hist_true[i] * hist_pred[i] for i in range(num_classes)) / (n * n)
+
+    if pe == 1.0:
+        return 1.0
+    return (po - pe) / (1 - pe)
 
 
 # ------------------------------------------------------------------ #

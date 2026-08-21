@@ -9,7 +9,8 @@ Usage:
 
 What it does:
   1. Copies and renames task label files with consistent naming
-  2. Splits T4/T5/T6 into train/test (80/20, stratified, seed=42)
+  2. Splits T4/T5 into train/test (80/20, stratified, seed=42)
+     and writes T6's fixed train/validation/test split files from its unified source
   3. Normalizes field names (e.g., T6 label shorthand)
   4. Creates a manifest.json listing all files and their metadata
   5. Skips large files (posts, OHLCV, market metadata) — upload those separately
@@ -73,7 +74,15 @@ def prepare_t2(source: Path, output: Path):
 
 
 def prepare_t3(source: Path, output: Path):
-    """T3: Test-only (resolution tier). Large JSON array."""
+    """T3: silver export (`train` split) + human-adjudicated gold audit pool
+    (`gold` split) - NOT a train/test pair in the conventional sense; baselines
+    self-split the silver export 70/30 by condition_id at runtime, and `gold`
+    is the actual held-out ground truth. See T3_Reproducible_Package.
+
+    NOTE: gold-pool preparation (source/task3/t3_gold_pool.json -> `gold`
+    split) is not wired up in this script yet - add it here once the raw
+    gold-pool source file's layout is finalized.
+    """
     print("\n[T3] Evidence Grading")
     with open(source / "task3" / "t3_final_graded.json", "r") as f:
         rows = json.load(f)
@@ -81,11 +90,11 @@ def prepare_t3(source: Path, output: Path):
         rows = list(rows.values())
 
     # Write as JSONL for streaming compatibility
-    write_jsonl(rows, output / "t3" / "test.jsonl")
+    write_jsonl(rows, output / "t3" / "train.jsonl")
 
     grades = Counter(r.get("final_grade") for r in rows)
     print(f"  Grade distribution: {dict(sorted(grades.items()))}")
-    return {"task": "t3", "test": len(rows), "grades": dict(sorted(grades.items()))}
+    return {"task": "t3", "train": len(rows), "grades": dict(sorted(grades.items()))}
 
 
 def prepare_t4(source: Path, output: Path):
@@ -127,22 +136,38 @@ def prepare_t5(source: Path, output: Path):
 
 
 def prepare_t6(source: Path, output: Path):
-    """T6: Stratified 80/20 split on label."""
+    """T6: Fixed split from the unified t6_full_with_split.jsonl file."""
     print("\n[T6] Cross-Market Propagation")
-    rows = load_jsonl(source / "task6" / "task6_labels_v2_tuned_t35confound_full.jsonl")
+    full_path = source / "task6" / "t6_full_with_split.jsonl"
+    if not full_path.exists():
+        raise FileNotFoundError(
+            f"T6 requires the fixed unified file with split/features: {full_path}"
+        )
+    rows = load_jsonl(full_path)
     df = pd.DataFrame(rows)
+    if "split" not in df.columns:
+        raise ValueError("T6 unified file must contain a split column.")
 
-    train_df, test_df = train_test_split(
-        df, test_size=TEST_SIZE, random_state=RANDOM_STATE,
-        stratify=df["label"],
-    )
-
-    write_jsonl(train_df.to_dict("records"), output / "t6" / "train.jsonl")
-    write_jsonl(test_df.to_dict("records"), output / "t6" / "test.jsonl")
+    split_paths = {
+        "train": output / "t6" / "train.jsonl",
+        "val": output / "t6" / "validation.jsonl",
+        "test": output / "t6" / "test.jsonl",
+    }
+    for split_name, path in split_paths.items():
+        split_rows = df[df["split"] == split_name].to_dict("records")
+        write_jsonl(split_rows, path)
 
     labels = Counter(df["label"])
+    split_counts = Counter(df["split"])
     print(f"  Label distribution: {dict(labels)}")
-    return {"task": "t6", "train": len(train_df), "test": len(test_df), "labels": dict(labels)}
+    print(f"  Split distribution: {dict(split_counts)}")
+    return {
+        "task": "t6",
+        "train": int(split_counts.get("train", 0)),
+        "val": int(split_counts.get("val", 0)),
+        "test": int(split_counts.get("test", 0)),
+        "labels": dict(labels),
+    }
 
 
 def prepare_market_metadata(source: Path, output: Path):

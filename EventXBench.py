@@ -24,7 +24,7 @@ import datasets
 
 _DESCRIPTION = (
     "EventX: A multimodal benchmark linking Twitter/X posts to "
-    "Polymarket prediction market dynamics across seven tasks."
+    "Polymarket prediction market dynamics across six canonical tasks."
 )
 
 _HOMEPAGE = "https://github.com/mlsys-io/EventXBench"
@@ -33,13 +33,19 @@ _LICENSE = "cc-by-nc-4.0"
 _URLS = {
     "t1_train": "data/t1/train.jsonl",
     "t1_test": "data/t1/test.jsonl",
-    "t2_test": "data/t2/test.jsonl",
-    "t3_test": "data/t3/test.jsonl",
+    "t2_train": "data/t2/t2_train.jsonl",
+    "t2_validation": "data/t2/t2_val.jsonl",
+    "t2_test": "data/t2/t2_test.jsonl",
+    "t3_train": "data/t3/train.jsonl",
+    "t3_gold": "data/t3/gold.jsonl",
     "t4_train": "data/t4/train.jsonl",
+    "t4_validation": "data/t4/validation.jsonl",
     "t4_test": "data/t4/test.jsonl",
     "t5_train": "data/t5/train.jsonl",
+    "t5_validation": "data/t5/validation.jsonl",
     "t5_test": "data/t5/test.jsonl",
     "t6_train": "data/t6/train.jsonl",
+    "t6_validation": "data/t6/validation.jsonl",
     "t6_test": "data/t6/test.jsonl",
     "t7_train": "data/t7/train.jsonl",
     "t7_test": "data/t7/test.jsonl",
@@ -72,27 +78,32 @@ class EventXBench(datasets.GeneratorBasedBuilder):
         EventXBenchConfig(
             name="t3",
             version=VERSION,
-            description="T3: Evidence Grading (ordinal 0-5)",
+            description=(
+                "T3: Evidence Grading (ordinal 0-5). 'train' split = full "
+                "silver-labeled export (final_grade); 'gold' split = the "
+                "separate, rare-grade-enriched, human-adjudicated audit pool "
+                "(gold_grade) - the actual held-out ground truth."
+            ),
         ),
         EventXBenchConfig(
             name="t4",
             version=VERSION,
-            description="T4: Market Movement Prediction (direction x magnitude)",
+            description="T4: Daily Market Movement Prediction (1/3/7-day horizons)",
         ),
         EventXBenchConfig(
             name="t5",
             version=VERSION,
-            description="T5: Volume & Price Impact (decay classification)",
+            description="T5: Forward Drift, Volume, and Persistence Prediction",
         ),
         EventXBenchConfig(
             name="t6",
             version=VERSION,
-            description="T6: Cross-Market Propagation (3-class)",
+            description="T6: Daily Cross-Market Co-Movement Forecasting (3-class)",
         ),
         EventXBenchConfig(
             name="t7",
             version=VERSION,
-            description="T7: Impact Persistence / Decay classification (3-class)",
+            description="Legacy T7 decay-only compatibility alias",
         ),
     ]
 
@@ -121,7 +132,9 @@ class EventXBench(datasets.GeneratorBasedBuilder):
 
         splits = []
         train_key = f"{config}_train"
+        validation_key = f"{config}_validation"
         test_key = f"{config}_test"
+        gold_key = f"{config}_gold"
 
         if train_key in downloaded:
             splits.append(
@@ -130,11 +143,27 @@ class EventXBench(datasets.GeneratorBasedBuilder):
                     gen_kwargs={"filepath": downloaded[train_key]},
                 )
             )
+        if validation_key in downloaded:
+            splits.append(
+                datasets.SplitGenerator(
+                    name=datasets.Split.VALIDATION,
+                    gen_kwargs={"filepath": downloaded[validation_key]},
+                )
+            )
         if test_key in downloaded:
             splits.append(
                 datasets.SplitGenerator(
                     name=datasets.Split.TEST,
                     gen_kwargs={"filepath": downloaded[test_key]},
+                )
+            )
+        if gold_key in downloaded:
+            # Custom named split - human-adjudicated audit pool (T3 only).
+            # Not a train/validation/test split; do not conflate with TEST.
+            splits.append(
+                datasets.SplitGenerator(
+                    name=datasets.NamedSplit("gold"),
+                    gen_kwargs={"filepath": downloaded[gold_key]},
                 )
             )
 
